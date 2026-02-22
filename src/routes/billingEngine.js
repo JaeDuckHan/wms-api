@@ -8,6 +8,12 @@ const router = express.Router();
 
 const BILLING_UNITS = ["ORDER", "SKU", "BOX", "CBM", "PALLET", "EVENT", "MONTH"];
 const PRICING_POLICIES = ["THB_BASED", "KRW_FIXED"];
+let hasInvoiceMonthColumnCache = null;
+let hasInvoiceDateColumnCache = null;
+let hasInvoiceFxRateColumnCache = null;
+let hasClientDefaultWarehouseColumnCache = null;
+const schemaColumnCache = new Map();
+const schemaTableCache = new Map();
 
 function trunc100(input) {
   const value = Number(input || 0);
@@ -90,6 +96,157 @@ function normalizeInvoiceStatus(status) {
   return null;
 }
 
+async function hasInvoiceMonthColumn(conn = getPool()) {
+  if (hasInvoiceMonthColumnCache !== null) return hasInvoiceMonthColumnCache;
+
+  const [rows] = await conn.query(
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.columns
+     WHERE table_schema = DATABASE()
+       AND table_name = 'invoices'
+       AND column_name = 'invoice_month'`
+  );
+
+  hasInvoiceMonthColumnCache = Number(rows[0]?.cnt || 0) > 0;
+  return hasInvoiceMonthColumnCache;
+}
+
+function invoiceMonthExpr(hasInvoiceMonthColumn, alias) {
+  return hasInvoiceMonthColumn ? `${alias}.invoice_month` : `DATE_FORMAT(${alias}.issue_date, '%Y-%m')`;
+}
+
+async function hasInvoiceDateColumn(conn = getPool()) {
+  if (hasInvoiceDateColumnCache !== null) return hasInvoiceDateColumnCache;
+
+  const [rows] = await conn.query(
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.columns
+     WHERE table_schema = DATABASE()
+       AND table_name = 'invoices'
+       AND column_name = 'invoice_date'`
+  );
+
+  hasInvoiceDateColumnCache = Number(rows[0]?.cnt || 0) > 0;
+  return hasInvoiceDateColumnCache;
+}
+
+function invoiceDateExpr(hasInvoiceDateColumn, alias) {
+  return hasInvoiceDateColumn ? `${alias}.invoice_date` : `${alias}.issue_date`;
+}
+
+async function hasInvoiceFxRateColumn(conn = getPool()) {
+  if (hasInvoiceFxRateColumnCache !== null) return hasInvoiceFxRateColumnCache;
+  const [rows] = await conn.query(
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.columns
+     WHERE table_schema = DATABASE()
+       AND table_name = 'invoices'
+       AND column_name = 'fx_rate_thbkrw'`
+  );
+  hasInvoiceFxRateColumnCache = Number(rows[0]?.cnt || 0) > 0;
+  return hasInvoiceFxRateColumnCache;
+}
+
+async function hasTable(tableName, conn = getPool()) {
+  const key = String(tableName);
+  if (schemaTableCache.has(key)) return schemaTableCache.get(key);
+  const [rows] = await conn.query(
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.tables
+     WHERE table_schema = DATABASE()
+       AND table_name = ?`,
+    [key]
+  );
+  const result = Number(rows[0]?.cnt || 0) > 0;
+  schemaTableCache.set(key, result);
+  return result;
+}
+
+async function hasColumn(tableName, columnName, conn = getPool()) {
+  const key = `${tableName}.${columnName}`;
+  if (schemaColumnCache.has(key)) return schemaColumnCache.get(key);
+  const [rows] = await conn.query(
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.columns
+     WHERE table_schema = DATABASE()
+       AND table_name = ?
+       AND column_name = ?`,
+    [tableName, columnName]
+  );
+  const result = Number(rows[0]?.cnt || 0) > 0;
+  schemaColumnCache.set(key, result);
+  return result;
+}
+
+async function hasClientDefaultWarehouseColumn(conn = getPool()) {
+  if (hasClientDefaultWarehouseColumnCache !== null) return hasClientDefaultWarehouseColumnCache;
+
+  const [rows] = await conn.query(
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.columns
+     WHERE table_schema = DATABASE()
+       AND table_name = 'clients'
+       AND column_name = 'default_warehouse_id'`
+  );
+  hasClientDefaultWarehouseColumnCache = Number(rows[0]?.cnt || 0) > 0;
+  return hasClientDefaultWarehouseColumnCache;
+}
+
+async function resolveWarehouseIdFromReference(conn, referenceType, referenceId) {
+  if (!referenceId || !referenceType) return null;
+
+  const normalizedType = String(referenceType).toUpperCase();
+  if (normalizedType === "OUTBOUND") {
+    const [rows] = await conn.query(
+      `SELECT warehouse_id
+       FROM outbound_orders
+       WHERE deleted_at IS NULL
+         AND (CAST(id AS CHAR) = ? OR outbound_no = ?)
+       ORDER BY id DESC
+       LIMIT 1`,
+      [String(referenceId), String(referenceId)]
+    );
+    return rows[0]?.warehouse_id ?? null;
+  }
+  if (normalizedType === "INBOUND") {
+    const [rows] = await conn.query(
+      `SELECT warehouse_id
+       FROM inbound_orders
+       WHERE deleted_at IS NULL
+         AND (CAST(id AS CHAR) = ? OR inbound_no = ?)
+       ORDER BY id DESC
+       LIMIT 1`,
+      [String(referenceId), String(referenceId)]
+    );
+    return rows[0]?.warehouse_id ?? null;
+  }
+  return null;
+}
+
+async function resolveClientDefaultWarehouseId(conn, clientId) {
+  const hasColumn = await hasClientDefaultWarehouseColumn(conn);
+  if (!hasColumn) return null;
+  const [rows] = await conn.query(
+    `SELECT default_warehouse_id
+     FROM clients
+     WHERE id = ? AND deleted_at IS NULL
+     LIMIT 1`,
+    [clientId]
+  );
+  return rows[0]?.default_warehouse_id ?? null;
+}
+
+async function resolveWarehouseIdForBillingEvent(conn, payload) {
+  if (payload.warehouse_id) return Number(payload.warehouse_id);
+
+  const byRef = await resolveWarehouseIdFromReference(conn, payload.reference_type, payload.reference_id);
+  if (byRef) return Number(byRef);
+
+  const byClientDefault = await resolveClientDefaultWarehouseId(conn, payload.client_id);
+  if (byClientDefault) return Number(byClientDefault);
+  return null;
+}
+
 const serviceCatalogSchema = z.object({
   service_code: z.string().min(1).max(80),
   service_name: z.string().min(1).max(255),
@@ -119,6 +276,7 @@ const exchangeRateSchema = z.object({
 
 const billingEventSchema = z.object({
   client_id: z.coerce.number().int().positive(),
+  warehouse_id: z.coerce.number().int().positive().nullable().optional(),
   service_code: z.string().min(1).max(80),
   reference_type: z.string().min(1).max(40),
   reference_id: z.string().max(120).nullable().optional(),
@@ -143,7 +301,8 @@ const markPendingSchema = z.object({
   ids: z.array(z.coerce.number().int().positive()).min(1)
 });
 
-function buildBillingEventsWhere(query) {
+function buildBillingEventsWhere(query, options = {}) {
+  const hasWarehouseId = options.hasWarehouseId !== false;
   const params = [];
   let where = " WHERE be.deleted_at IS NULL";
 
@@ -159,6 +318,10 @@ function buildBillingEventsWhere(query) {
     where += " AND be.service_code = ?";
     params.push(String(query.service_code));
   }
+  if (hasWarehouseId && query.warehouse_id) {
+    where += " AND be.warehouse_id = ?";
+    params.push(Number(query.warehouse_id));
+  }
   if (query.invoice_month && /^\d{4}-\d{2}$/.test(String(query.invoice_month))) {
     where += " AND DATE_FORMAT(be.event_date, '%Y-%m') = ?";
     params.push(String(query.invoice_month));
@@ -169,9 +332,22 @@ function buildBillingEventsWhere(query) {
 
 router.get("/billing/settings/service-catalog", async (_req, res) => {
   try {
+    const hasServiceName = await hasColumn("service_catalog", "service_name");
+    const hasBillingUnit = await hasColumn("service_catalog", "billing_unit");
+    const hasPricingPolicy = await hasColumn("service_catalog", "pricing_policy");
+    const hasDefaultRate = await hasColumn("service_catalog", "default_rate");
+
+    const serviceNameExpr = hasServiceName ? "COALESCE(service_name, service_name_kr)" : "service_name_kr";
+    const billingUnitExpr = hasBillingUnit
+      ? "billing_unit"
+      : `CASE billing_basis WHEN 'ORDER' THEN 'ORDER' WHEN 'BOX' THEN 'BOX' WHEN 'QTY' THEN 'SKU' ELSE 'EVENT' END`;
+    const pricingPolicyExpr = hasPricingPolicy ? "pricing_policy" : "'KRW_FIXED'";
+    const defaultRateExpr = hasDefaultRate ? "default_rate" : "0";
+
     const [rows] = await getPool().query(
-      `SELECT id, service_code, COALESCE(service_name, service_name_kr) AS service_name,
-              billing_unit, pricing_policy, default_currency, default_rate, status, created_at, updated_at
+      `SELECT id, service_code, ${serviceNameExpr} AS service_name,
+              ${billingUnitExpr} AS billing_unit, ${pricingPolicyExpr} AS pricing_policy,
+              default_currency, ${defaultRateExpr} AS default_rate, status, created_at, updated_at
        FROM service_catalog
        WHERE deleted_at IS NULL
        ORDER BY service_code ASC`
@@ -282,6 +458,11 @@ router.delete("/billing/settings/service-catalog/:serviceCode", async (req, res)
 router.get("/billing/settings/client-contract-rates", async (req, res) => {
   const { client_id, service_code } = req.query;
   try {
+    const exists = await hasTable("client_contract_rates");
+    if (!exists) {
+      return res.json({ ok: true, data: [] });
+    }
+
     let query = `SELECT id, client_id, service_code, custom_rate, currency, effective_date, created_at, updated_at
                  FROM client_contract_rates
                  WHERE deleted_at IS NULL`;
@@ -392,15 +573,27 @@ router.delete("/billing/settings/client-contract-rates/:id", async (req, res) =>
 router.get("/billing/settings/exchange-rates", async (req, res) => {
   const { month } = req.query;
   try {
-    let query = `SELECT er.id, er.rate_date, er.base_currency, er.quote_currency, er.rate, er.source, er.locked, er.status,
+    const hasSource = await hasColumn("exchange_rates", "source");
+    const hasLocked = await hasColumn("exchange_rates", "locked");
+    const hasInvoiceFxRate = await hasInvoiceFxRateColumn();
+    const hasInvoiceMonth = await hasInvoiceMonthColumn();
+
+    const sourceExpr = hasSource ? "er.source" : "'manual'";
+    const lockedExpr = hasLocked ? "er.locked" : "0";
+    const usedInvoiceCountExpr = hasInvoiceFxRate
+      ? `(
+          SELECT COUNT(*)
+          FROM invoices i
+          WHERE i.deleted_at IS NULL
+            ${hasInvoiceMonth ? "AND i.invoice_month IS NOT NULL" : ""}
+            AND i.fx_rate_thbkrw = er.rate
+        )`
+      : "0";
+
+    let query = `SELECT er.id, er.rate_date, er.base_currency, er.quote_currency, er.rate,
+                        ${sourceExpr} AS source, ${lockedExpr} AS locked, er.status,
                         er.created_at, er.updated_at,
-                        (
-                          SELECT COUNT(*)
-                          FROM invoices i
-                          WHERE i.deleted_at IS NULL
-                            AND i.invoice_month IS NOT NULL
-                            AND i.fx_rate_thbkrw = er.rate
-                        ) AS used_invoice_count
+                        ${usedInvoiceCountExpr} AS used_invoice_count
                  FROM exchange_rates er
                  WHERE er.deleted_at IS NULL
                    AND er.base_currency = 'THB'
@@ -525,18 +718,42 @@ router.delete("/billing/settings/exchange-rates/:id", async (req, res) => {
 
 router.get("/billing/events", async (req, res) => {
   try {
-    const { where, params } = buildBillingEventsWhere(req.query);
+    const exists = await hasTable("billing_events");
+    if (!exists) {
+      return res.json({ ok: true, data: [], alerts: { missing_warehouse_id: 0 } });
+    }
+
+    const hasWarehouseId = await hasColumn("billing_events", "warehouse_id");
+    const warehouseExpr = hasWarehouseId ? "be.warehouse_id" : "NULL";
+    const { where, params } = buildBillingEventsWhere(req.query, { hasWarehouseId });
     const [rows] = await getPool().query(
       `SELECT be.id, be.event_date, be.client_id, c.client_code, c.name_kr,
               be.service_code, be.qty, be.amount_thb, be.fx_rate_thbkrw, be.amount_krw,
-              be.reference_type, be.reference_id, be.status, be.invoice_id
+              be.reference_type, be.reference_id, ${warehouseExpr} AS warehouse_id, be.status, be.invoice_id
        FROM billing_events be
        JOIN clients c ON c.id = be.client_id
        ${where}
        ORDER BY be.event_date DESC, be.id DESC`,
       params
     );
-    return res.json({ ok: true, data: rows });
+    const alertRows = hasWarehouseId
+      ? (
+          await getPool().query(
+            `SELECT COUNT(*) AS missing_warehouse_id
+             FROM billing_events be
+             ${where}
+             AND be.warehouse_id IS NULL`,
+            params
+          )
+        )[0]
+      : [{ missing_warehouse_id: 0 }];
+    return res.json({
+      ok: true,
+      data: rows,
+      alerts: {
+        missing_warehouse_id: Number(alertRows[0]?.missing_warehouse_id || 0)
+      }
+    });
   } catch (error) {
     return res.status(500).json({ ok: false, message: error.message });
   }
@@ -544,10 +761,20 @@ router.get("/billing/events", async (req, res) => {
 
 router.get("/billing/events/export.csv", async (req, res) => {
   try {
-    const { where, params } = buildBillingEventsWhere(req.query);
+    const exists = await hasTable("billing_events");
+    if (!exists) {
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", "attachment; filename=billing_events.csv");
+      const header = "event_date,client,service_code,qty,amount_thb,fx_rate_thbkrw,amount_krw,reference_type,reference_id,warehouse_id,status";
+      return res.send(header);
+    }
+
+    const hasWarehouseId = await hasColumn("billing_events", "warehouse_id");
+    const warehouseExpr = hasWarehouseId ? "be.warehouse_id" : "NULL";
+    const { where, params } = buildBillingEventsWhere(req.query, { hasWarehouseId });
     const [rows] = await getPool().query(
       `SELECT be.event_date, c.client_code, be.service_code, be.qty, be.amount_thb,
-              be.fx_rate_thbkrw, be.amount_krw, be.reference_type, be.reference_id, be.status
+              be.fx_rate_thbkrw, be.amount_krw, be.reference_type, be.reference_id, ${warehouseExpr} AS warehouse_id, be.status
        FROM billing_events be
        JOIN clients c ON c.id = be.client_id
        ${where}
@@ -555,7 +782,7 @@ router.get("/billing/events/export.csv", async (req, res) => {
       params
     );
 
-    const header = "event_date,client,service_code,qty,amount_thb,fx_rate_thbkrw,amount_krw,reference_type,reference_id,status";
+    const header = "event_date,client,service_code,qty,amount_thb,fx_rate_thbkrw,amount_krw,reference_type,reference_id,warehouse_id,status";
     const lines = rows.map((r) => {
       const values = [
         r.event_date,
@@ -567,6 +794,7 @@ router.get("/billing/events/export.csv", async (req, res) => {
         r.amount_krw,
         r.reference_type,
         r.reference_id,
+        r.warehouse_id,
         r.status
       ];
       return values
@@ -637,27 +865,49 @@ router.post("/billing/events", validate(billingEventSchema), async (req, res) =>
   const amountKrw = payload.amount_krw ?? (payload.unit_price_krw ?? 0) * (payload.qty ?? 0);
 
   try {
-    const [result] = await getPool().query(
-      `INSERT INTO billing_events
-        (client_id, service_code, reference_type, reference_id, event_date, qty, pricing_policy, unit_price_thb, amount_thb, unit_price_krw, amount_krw)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        payload.client_id,
-        payload.service_code,
-        payload.reference_type,
-        payload.reference_id || null,
-        payload.event_date,
-        payload.qty,
-        payload.pricing_policy,
-        payload.unit_price_thb || null,
-        payload.pricing_policy === "THB_BASED" ? amountThb : null,
-        payload.unit_price_krw || null,
-        payload.pricing_policy === "KRW_FIXED" ? trunc100(amountKrw) : null
-      ]
-    );
+    const hasWarehouseId = await hasColumn("billing_events", "warehouse_id");
+    const warehouseId = hasWarehouseId ? await resolveWarehouseIdForBillingEvent(getPool(), payload) : null;
+    const [result] = hasWarehouseId
+      ? await getPool().query(
+          `INSERT INTO billing_events
+            (client_id, warehouse_id, service_code, reference_type, reference_id, event_date, qty, pricing_policy, unit_price_thb, amount_thb, unit_price_krw, amount_krw)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            payload.client_id,
+            warehouseId,
+            payload.service_code,
+            payload.reference_type,
+            payload.reference_id || null,
+            payload.event_date,
+            payload.qty,
+            payload.pricing_policy,
+            payload.unit_price_thb || null,
+            payload.pricing_policy === "THB_BASED" ? amountThb : null,
+            payload.unit_price_krw || null,
+            payload.pricing_policy === "KRW_FIXED" ? trunc100(amountKrw) : null
+          ]
+        )
+      : await getPool().query(
+          `INSERT INTO billing_events
+            (client_id, service_code, reference_type, reference_id, event_date, qty, pricing_policy, unit_price_thb, amount_thb, unit_price_krw, amount_krw)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            payload.client_id,
+            payload.service_code,
+            payload.reference_type,
+            payload.reference_id || null,
+            payload.event_date,
+            payload.qty,
+            payload.pricing_policy,
+            payload.unit_price_thb || null,
+            payload.pricing_policy === "THB_BASED" ? amountThb : null,
+            payload.unit_price_krw || null,
+            payload.pricing_policy === "KRW_FIXED" ? trunc100(amountKrw) : null
+          ]
+        );
 
     const [rows] = await getPool().query(
-      `SELECT id, client_id, service_code, reference_type, reference_id, event_date, qty, pricing_policy,
+      `SELECT id, client_id, ${hasWarehouseId ? "warehouse_id" : "NULL AS warehouse_id"}, service_code, reference_type, reference_id, event_date, qty, pricing_policy,
               unit_price_thb, amount_thb, unit_price_krw, amount_krw, fx_rate_thbkrw, invoice_id, status, created_at, updated_at
        FROM billing_events
        WHERE id = ?`,
@@ -670,20 +920,34 @@ router.post("/billing/events", validate(billingEventSchema), async (req, res) =>
 });
 router.post("/billing/events/sample", async (req, res) => {
   const clientId = Number(req.body?.client_id || 1);
+  const warehouseId = req.body?.warehouse_id ? Number(req.body.warehouse_id) : null;
   const month = String(req.body?.invoice_month || "2026-01");
   const dateA = `${month}-03`;
   const dateB = `${month}-07`;
 
   try {
-    await getPool().query(
-      `INSERT INTO billing_events
-        (client_id, service_code, reference_type, reference_id, event_date, qty, pricing_policy, unit_price_thb, amount_thb)
-       VALUES
-        (?, 'TH_SHIPPING', 'SHIPPING', 'SAMPLE-SHP-001', ?, 1, 'THB_BASED', 120, 120),
-        (?, 'TH_BOX', 'SHIPPING', 'SAMPLE-BOX-001', ?, 5, 'THB_BASED', 8, 40),
-        (?, 'OUTBOUND_FEE', 'OUTBOUND', 'SAMPLE-OUT-001', ?, 3, 'KRW_FIXED', NULL, NULL)`,
-      [clientId, dateA, clientId, dateB, clientId, dateB]
-    );
+    const hasWarehouseId = await hasColumn("billing_events", "warehouse_id");
+    if (hasWarehouseId) {
+      await getPool().query(
+        `INSERT INTO billing_events
+          (client_id, warehouse_id, service_code, reference_type, reference_id, event_date, qty, pricing_policy, unit_price_thb, amount_thb)
+         VALUES
+          (?, ?, 'TH_SHIPPING', 'SHIPPING', 'SAMPLE-SHP-001', ?, 1, 'THB_BASED', 120, 120),
+          (?, ?, 'TH_BOX', 'SHIPPING', 'SAMPLE-BOX-001', ?, 5, 'THB_BASED', 8, 40),
+          (?, ?, 'OUTBOUND_FEE', 'OUTBOUND', 'SAMPLE-OUT-001', ?, 3, 'KRW_FIXED', NULL, NULL)`,
+        [clientId, warehouseId, dateA, clientId, warehouseId, dateB, clientId, warehouseId, dateB]
+      );
+    } else {
+      await getPool().query(
+        `INSERT INTO billing_events
+          (client_id, service_code, reference_type, reference_id, event_date, qty, pricing_policy, unit_price_thb, amount_thb)
+         VALUES
+          (?, 'TH_SHIPPING', 'SHIPPING', 'SAMPLE-SHP-001', ?, 1, 'THB_BASED', 120, 120),
+          (?, 'TH_BOX', 'SHIPPING', 'SAMPLE-BOX-001', ?, 5, 'THB_BASED', 8, 40),
+          (?, 'OUTBOUND_FEE', 'OUTBOUND', 'SAMPLE-OUT-001', ?, 3, 'KRW_FIXED', NULL, NULL)`,
+        [clientId, dateA, clientId, dateB, clientId, dateB]
+      );
+    }
 
     await getPool().query(
       `UPDATE billing_events
@@ -708,6 +972,7 @@ router.post("/billing/invoices/generate", validate(generateInvoiceSchema), async
     const result = await withTransaction(async (conn) => {
       const payload = req.body;
       const createdBy = parseCreator(req, payload.created_by);
+      const hasInvoiceDate = await hasInvoiceDateColumn(conn);
       const { from, to } = monthRange(payload.invoice_month);
 
       const [existingRows] = await conn.query(
@@ -800,22 +1065,30 @@ router.post("/billing/invoices/generate", validate(generateInvoiceSchema), async
       const nextSeq = await resolveInvoiceSequence(conn, payload.client_id, yyyymm);
       const invoiceNo = `KRW-${payload.client_id}-${yyyymm}-${String(nextSeq).padStart(4, "0")}`;
 
-      const [invoiceCreated] = await conn.query(
-        `INSERT INTO invoices
-          (settlement_batch_id, client_id, invoice_month, invoice_no, status, issue_date, invoice_date, due_date, recipient_email,
-           currency, fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw, total_amount, created_by)
-         VALUES (NULL, ?, ?, ?, 'draft', ?, ?, ?, NULL, 'KRW', ?, 0, 0, 0, 0, ?)`,
-        [
-          payload.client_id,
-          payload.invoice_month,
-          invoiceNo,
-          payload.invoice_date,
-          payload.invoice_date,
-          payload.invoice_date,
-          fx,
-          createdBy
-        ]
-      );
+      const [invoiceCreated] = hasInvoiceDate
+        ? await conn.query(
+            `INSERT INTO invoices
+              (settlement_batch_id, client_id, invoice_month, invoice_no, status, issue_date, invoice_date, due_date, recipient_email,
+               currency, fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw, total_amount, created_by)
+             VALUES (NULL, ?, ?, ?, 'draft', ?, ?, ?, NULL, 'KRW', ?, 0, 0, 0, 0, ?)`,
+            [
+              payload.client_id,
+              payload.invoice_month,
+              invoiceNo,
+              payload.invoice_date,
+              payload.invoice_date,
+              payload.invoice_date,
+              fx,
+              createdBy
+            ]
+          )
+        : await conn.query(
+            `INSERT INTO invoices
+              (settlement_batch_id, client_id, invoice_month, invoice_no, status, issue_date, due_date, recipient_email,
+               currency, fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw, total_amount, created_by)
+             VALUES (NULL, ?, ?, ?, 'draft', ?, ?, NULL, 'KRW', ?, 0, 0, 0, 0, ?)`,
+            [payload.client_id, payload.invoice_month, invoiceNo, payload.invoice_date, payload.invoice_date, fx, createdBy]
+          );
       const invoiceId = Number(invoiceCreated.insertId);
 
       const [serviceNameRows] = await conn.query(
@@ -890,10 +1163,11 @@ router.post("/billing/invoices/generate", validate(generateInvoiceSchema), async
         [subtotalKrw, vatKrw, totalKrw, totalKrw, invoiceId]
       );
 
+      const invoiceDateColumn = invoiceDateExpr(hasInvoiceDate, "i");
       const [invoiceRows] = await conn.query(
-        `SELECT id, client_id, invoice_no, invoice_month, invoice_date, currency, fx_rate_thbkrw,
+        `SELECT id, client_id, invoice_no, invoice_month, ${invoiceDateColumn} AS invoice_date, currency, fx_rate_thbkrw,
                 subtotal_krw, vat_krw, total_krw, status, created_at, updated_at
-         FROM invoices
+         FROM invoices i
          WHERE id = ?`,
         [invoiceId]
       );
@@ -965,6 +1239,7 @@ router.post("/billing/invoices/:id/duplicate-admin", async (req, res) => {
   try {
     const result = await withTransaction(async (conn) => {
       const sourceInvoiceId = Number(req.params.id);
+      const hasInvoiceDate = await hasInvoiceDateColumn(conn);
       const [invoiceRows] = await conn.query(
         `SELECT id, client_id, invoice_month, status
          FROM invoices
@@ -987,16 +1262,27 @@ router.post("/billing/invoices/:id/duplicate-admin", async (req, res) => {
       const nextSeq = await resolveInvoiceSequence(conn, source.client_id, yyyymm);
       const newInvoiceNo = `KRW-${source.client_id}-${yyyymm}-${String(nextSeq).padStart(4, "0")}`;
 
-      const [created] = await conn.query(
-        `INSERT INTO invoices
-          (settlement_batch_id, client_id, invoice_month, invoice_no, status, issue_date, invoice_date, due_date, recipient_email,
-           currency, fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw, total_amount, created_by)
-         SELECT NULL, client_id, invoice_month, ?, 'draft', issue_date, invoice_date, due_date, recipient_email,
-                'KRW', fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw, total_krw, created_by
-         FROM invoices
-         WHERE id = ?`,
-        [newInvoiceNo, sourceInvoiceId]
-      );
+      const [created] = hasInvoiceDate
+        ? await conn.query(
+            `INSERT INTO invoices
+              (settlement_batch_id, client_id, invoice_month, invoice_no, status, issue_date, invoice_date, due_date, recipient_email,
+               currency, fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw, total_amount, created_by)
+             SELECT NULL, client_id, invoice_month, ?, 'draft', issue_date, invoice_date, due_date, recipient_email,
+                    'KRW', fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw, total_krw, created_by
+             FROM invoices
+             WHERE id = ?`,
+            [newInvoiceNo, sourceInvoiceId]
+          )
+        : await conn.query(
+            `INSERT INTO invoices
+              (settlement_batch_id, client_id, invoice_month, invoice_no, status, issue_date, due_date, recipient_email,
+               currency, fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw, total_amount, created_by)
+             SELECT NULL, client_id, invoice_month, ?, 'draft', issue_date, due_date, recipient_email,
+                    'KRW', fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw, total_krw, created_by
+             FROM invoices
+             WHERE id = ?`,
+            [newInvoiceNo, sourceInvoiceId]
+          );
       const newInvoiceId = Number(created.insertId);
 
       await conn.query(
@@ -1007,9 +1293,10 @@ router.post("/billing/invoices/:id/duplicate-admin", async (req, res) => {
         [newInvoiceId, sourceInvoiceId]
       );
 
+      const invoiceDateColumn = invoiceDateExpr(hasInvoiceDate, "i");
       const [newRows] = await conn.query(
-        `SELECT id, invoice_no, status, invoice_month, invoice_date, fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw
-         FROM invoices
+        `SELECT id, invoice_no, status, invoice_month, ${invoiceDateColumn} AS invoice_date, fx_rate_thbkrw, subtotal_krw, vat_krw, total_krw
+         FROM invoices i
          WHERE id = ?`,
         [newInvoiceId]
       );
@@ -1029,13 +1316,31 @@ router.get("/billing/invoices", async (req, res) => {
   const status = normalizeInvoiceStatus(req.query.status);
 
   try {
+    const hasInvoices = await hasTable("invoices");
+    if (!hasInvoices) {
+      return res.json({ ok: true, data: [] });
+    }
+
+    const hasInvoiceMonth = await hasInvoiceMonthColumn();
+    const hasInvoiceDate = await hasInvoiceDateColumn();
+    const hasFxRate = await hasColumn("invoices", "fx_rate_thbkrw");
+    const hasSubtotal = await hasColumn("invoices", "subtotal_krw");
+    const hasVat = await hasColumn("invoices", "vat_krw");
+    const hasTotalKrw = await hasColumn("invoices", "total_krw");
+    const fxExpr = hasFxRate ? "i.fx_rate_thbkrw" : "NULL";
+    const subtotalExpr = hasSubtotal ? "i.subtotal_krw" : "0";
+    const vatExpr = hasVat ? "i.vat_krw" : "0";
+    const totalExpr = hasTotalKrw ? "i.total_krw" : "i.total_amount";
+    const monthExpr = invoiceMonthExpr(hasInvoiceMonth, "i");
+    const dateExpr = invoiceDateExpr(hasInvoiceDate, "i");
+
     let query = `SELECT i.id, i.client_id, c.client_code, c.name_kr,
-                        i.invoice_no, i.invoice_month, i.invoice_date, i.currency,
-                        i.fx_rate_thbkrw, i.subtotal_krw, i.vat_krw, i.total_krw, i.status, i.created_at
+                        i.invoice_no, ${monthExpr} AS invoice_month, ${dateExpr} AS invoice_date, i.currency,
+                        ${fxExpr} AS fx_rate_thbkrw, ${subtotalExpr} AS subtotal_krw, ${vatExpr} AS vat_krw, ${totalExpr} AS total_krw, i.status, i.created_at
                  FROM invoices i
                  JOIN clients c ON c.id = i.client_id
                  WHERE i.deleted_at IS NULL
-                   AND i.invoice_month IS NOT NULL`;
+                   AND ${monthExpr} IS NOT NULL`;
     const params = [];
 
     if (client_id) {
@@ -1043,7 +1348,7 @@ router.get("/billing/invoices", async (req, res) => {
       params.push(client_id);
     }
     if (invoice_month) {
-      query += " AND i.invoice_month = ?";
+      query += ` AND ${monthExpr} = ?`;
       params.push(invoice_month);
     }
     if (status) {
@@ -1051,7 +1356,7 @@ router.get("/billing/invoices", async (req, res) => {
       params.push(status);
     }
 
-    query += " ORDER BY i.invoice_month DESC, i.id DESC";
+    query += ` ORDER BY ${monthExpr} DESC, i.id DESC`;
     const [rows] = await getPool().query(query, params);
     return res.json({ ok: true, data: rows });
   } catch (error) {
@@ -1061,13 +1366,33 @@ router.get("/billing/invoices", async (req, res) => {
 
 router.get("/billing/invoices/:id", async (req, res) => {
   try {
+    const hasInvoices = await hasTable("invoices");
+    if (!hasInvoices) {
+      return res.status(404).json({ ok: false, message: "Invoice not found" });
+    }
+
+    const hasInvoiceMonth = await hasInvoiceMonthColumn();
+    const hasInvoiceDate = await hasInvoiceDateColumn();
+    const hasFxRate = await hasColumn("invoices", "fx_rate_thbkrw");
+    const hasSubtotal = await hasColumn("invoices", "subtotal_krw");
+    const hasVat = await hasColumn("invoices", "vat_krw");
+    const hasTotalKrw = await hasColumn("invoices", "total_krw");
+    const hasInvoiceItems = await hasTable("invoice_items");
+
+    const monthExpr = invoiceMonthExpr(hasInvoiceMonth, "i");
+    const dateExpr = invoiceDateExpr(hasInvoiceDate, "i");
+    const fxExpr = hasFxRate ? "i.fx_rate_thbkrw" : "NULL";
+    const subtotalExpr = hasSubtotal ? "i.subtotal_krw" : "0";
+    const vatExpr = hasVat ? "i.vat_krw" : "0";
+    const totalExpr = hasTotalKrw ? "i.total_krw" : "i.total_amount";
+
     const [invoiceRows] = await getPool().query(
       `SELECT i.id, i.client_id, c.client_code, c.name_kr,
-              i.invoice_no, i.invoice_month, i.invoice_date, i.currency,
-              i.fx_rate_thbkrw, i.subtotal_krw, i.vat_krw, i.total_krw, i.status, i.created_at, i.updated_at,
-              (MOD(i.subtotal_krw, 100) = 0) AS subtotal_trunc100,
-              (MOD(i.vat_krw, 100) = 0) AS vat_trunc100,
-              (MOD(i.total_krw, 100) = 0) AS total_trunc100
+              i.invoice_no, ${monthExpr} AS invoice_month, ${dateExpr} AS invoice_date, i.currency,
+              ${fxExpr} AS fx_rate_thbkrw, ${subtotalExpr} AS subtotal_krw, ${vatExpr} AS vat_krw, ${totalExpr} AS total_krw, i.status, i.created_at, i.updated_at,
+              (MOD(${subtotalExpr}, 100) = 0) AS subtotal_trunc100,
+              (MOD(${vatExpr}, 100) = 0) AS vat_trunc100,
+              (MOD(${totalExpr}, 100) = 0) AS total_trunc100
        FROM invoices i
        JOIN clients c ON c.id = i.client_id
        WHERE i.id = ? AND i.deleted_at IS NULL`,
@@ -1078,15 +1403,17 @@ router.get("/billing/invoices/:id", async (req, res) => {
       return res.status(404).json({ ok: false, message: "Invoice not found" });
     }
 
-    const [itemRows] = await getPool().query(
-      `SELECT id, invoice_id, service_code, description, qty, unit_price_krw, amount_krw, created_at, updated_at,
-              (MOD(unit_price_krw, 100) = 0) AS unit_price_trunc100,
-              (MOD(amount_krw, 100) = 0) AS amount_trunc100
-       FROM invoice_items
-       WHERE invoice_id = ? AND deleted_at IS NULL
-       ORDER BY id ASC`,
-      [req.params.id]
-    );
+    const [itemRows] = hasInvoiceItems
+      ? await getPool().query(
+          `SELECT id, invoice_id, service_code, description, qty, unit_price_krw, amount_krw, created_at, updated_at,
+                  (MOD(unit_price_krw, 100) = 0) AS unit_price_trunc100,
+                  (MOD(amount_krw, 100) = 0) AS amount_trunc100
+           FROM invoice_items
+           WHERE invoice_id = ? AND deleted_at IS NULL
+           ORDER BY id ASC`,
+          [req.params.id]
+        )
+      : [[]];
 
     return res.json({
       ok: true,
@@ -1102,10 +1429,20 @@ router.get("/billing/invoices/:id", async (req, res) => {
 
 router.get("/billing/invoices/:id/export-pdf", async (req, res) => {
   try {
+    const hasInvoices = await hasTable("invoices");
+    if (!hasInvoices) {
+      return res.status(404).json({ ok: false, message: "Invoice not found" });
+    }
+
+    const hasInvoiceMonth = await hasInvoiceMonthColumn();
+    const hasTotalKrw = await hasColumn("invoices", "total_krw");
+    const monthExpr = invoiceMonthExpr(hasInvoiceMonth, "i");
+    const totalExpr = hasTotalKrw ? "i.total_krw" : "i.total_amount";
+
     const [invoiceRows] = await getPool().query(
-      `SELECT id, invoice_no, invoice_month, total_krw, status
-       FROM invoices
-       WHERE id = ? AND deleted_at IS NULL`,
+      `SELECT i.id, i.invoice_no, ${monthExpr} AS invoice_month, ${totalExpr} AS total_krw, i.status
+       FROM invoices i
+       WHERE i.id = ? AND i.deleted_at IS NULL`,
       [req.params.id]
     );
 
