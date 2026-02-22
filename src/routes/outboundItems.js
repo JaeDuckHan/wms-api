@@ -15,6 +15,7 @@ const {
   upsertOutboundServiceEvent,
   softDeleteOutboundServiceEvent
 } = require("../services/billing");
+const { syncOutboundOrderBillingEvent } = require("../services/billingEvents");
 
 const router = express.Router();
 
@@ -159,6 +160,7 @@ router.post("/", validate(outboundItemSchema), async (req, res) => {
         boxCount: box_count,
         remark
       });
+      await syncOutboundOrderBillingEvent(conn, order.id);
 
       const [rows] = await conn.query(
         `SELECT id, outbound_order_id, product_id, lot_id, location_id, qty, box_type, box_count, remark, created_at, updated_at
@@ -278,6 +280,10 @@ router.put("/:id", validate(outboundItemSchema), async (req, res) => {
         boxCount: box_count,
         remark
       });
+      if (Number(prev.outbound_order_id) !== Number(nextOrder.id)) {
+        await syncOutboundOrderBillingEvent(conn, prev.outbound_order_id);
+      }
+      await syncOutboundOrderBillingEvent(conn, nextOrder.id);
 
       const [rows] = await conn.query(
         `SELECT id, outbound_order_id, product_id, lot_id, location_id, qty, box_type, box_count, remark, created_at, updated_at
@@ -340,6 +346,7 @@ router.delete("/:id", async (req, res) => {
         await softDeleteOutboundServiceEvent(conn, stockTxnId);
       }
       await softDeleteStockTxn(conn, "outbound_ship", "outbound_item", req.params.id);
+      await syncOutboundOrderBillingEvent(conn, prev.outbound_order_id);
     });
 
     return res.json({ ok: true });

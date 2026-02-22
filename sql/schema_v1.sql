@@ -344,6 +344,25 @@ CREATE TABLE stock_balances (
   CONSTRAINT fk_balance_location FOREIGN KEY (location_id) REFERENCES warehouse_locations(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE storage_snapshots (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  warehouse_id BIGINT UNSIGNED NOT NULL,
+  client_id BIGINT UNSIGNED NOT NULL,
+  snapshot_date DATE NOT NULL,
+  total_cbm DECIMAL(18,4) NOT NULL DEFAULT 0,
+  total_pallet DECIMAL(18,4) NOT NULL DEFAULT 0,
+  total_sku INT UNSIGNED NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_storage_snapshot_wh_client_date (warehouse_id, client_id, snapshot_date),
+  KEY idx_storage_snapshot_date (snapshot_date),
+  KEY idx_storage_snapshot_wh_date (warehouse_id, snapshot_date),
+  KEY idx_storage_snapshot_client_date (client_id, snapshot_date),
+  CONSTRAINT fk_storage_snapshot_wh FOREIGN KEY (warehouse_id) REFERENCES warehouses(id),
+  CONSTRAINT fk_storage_snapshot_client FOREIGN KEY (client_id) REFERENCES clients(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE service_events (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   client_id BIGINT UNSIGNED NOT NULL,
