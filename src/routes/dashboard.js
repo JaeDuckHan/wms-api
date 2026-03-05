@@ -3,6 +3,7 @@ const { getPool } = require("../db");
 
 const router = express.Router();
 const PALLET_CBM = 1.2;
+const schemaColumnCache = new Map();
 
 function getTodayDate() {
   return new Date().toISOString().slice(0, 10);
@@ -165,6 +166,22 @@ function getCapacityStatus(usagePctCbm) {
     return "warn";
   }
   return "critical";
+}
+
+async function hasColumn(tableName, columnName, conn = getPool()) {
+  const key = `${tableName}.${columnName}`;
+  if (schemaColumnCache.has(key)) return schemaColumnCache.get(key);
+  const [rows] = await conn.query(
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.columns
+     WHERE table_schema = DATABASE()
+       AND table_name = ?
+       AND column_name = ?`,
+    [tableName, columnName]
+  );
+  const result = Number(rows[0]?.cnt || 0) > 0;
+  schemaColumnCache.set(key, result);
+  return result;
 }
 
 async function upsertStorageSnapshots(snapshotDate, filters) {
@@ -426,39 +443,63 @@ async function getStorageBillingPreview(req, res) {
   }
 
   try {
+    const hasRateCbmOverride = req.query.rateCbm != null && req.query.rateCbm !== "";
     const filters = filtersResult.value;
     const month = monthResult.value;
     const monthStart = `${month}-01`;
     const pool = getPool();
+    const hasDefaultCbmRate = await hasColumn("warehouses", "default_cbm_rate");
+    const rateCbmExpr = hasRateCbmOverride
+      ? "?"
+      : hasDefaultCbmRate
+        ? "COALESCE(w.default_cbm_rate, 0)"
+        : "0";
 
-    const params = [rateCbmResult.value, ratePalletResult.value, rateCbmResult.value, ratePalletResult.value, monthStart, monthStart];
+    const params = [monthStart, monthStart];
     const where = appendSnapshotFilter(
       " WHERE ss.snapshot_date >= ? AND ss.snapshot_date < DATE_ADD(?, INTERVAL 1 MONTH)",
       params,
       filters,
       "ss"
     );
+    const rateParams = hasRateCbmOverride
+      ? [
+          rateCbmResult.value,
+          ratePalletResult.value,
+          rateCbmResult.value,
+          ratePalletResult.value,
+          rateCbmResult.value,
+          ratePalletResult.value
+        ]
+      : [ratePalletResult.value, ratePalletResult.value, ratePalletResult.value];
+    const finalParams = [...rateParams, ...params];
 
     const [lines] = await pool.query(
       `SELECT
-        ss.warehouse_id,
-        ss.client_id,
-        COUNT(DISTINCT ss.snapshot_date) AS days_count,
-        ROUND(SUM(ss.total_cbm) / NULLIF(COUNT(DISTINCT ss.snapshot_date), 0), 4) AS avg_cbm,
-        ROUND(SUM(ss.total_pallet) / NULLIF(COUNT(DISTINCT ss.snapshot_date), 0), 4) AS avg_pallet,
-        ROUND((SUM(ss.total_cbm) / NULLIF(COUNT(DISTINCT ss.snapshot_date), 0)) * ?, 4) AS amount_cbm,
-        ROUND((SUM(ss.total_pallet) / NULLIF(COUNT(DISTINCT ss.snapshot_date), 0)) * ?, 4) AS amount_pallet,
-        ROUND(
-          ((SUM(ss.total_cbm) / NULLIF(COUNT(DISTINCT ss.snapshot_date), 0)) * ?)
-          +
-          ((SUM(ss.total_pallet) / NULLIF(COUNT(DISTINCT ss.snapshot_date), 0)) * ?),
-          4
-        ) AS amount_total
-       FROM storage_snapshots ss
-       ${where}
-       GROUP BY ss.warehouse_id, ss.client_id
-       ORDER BY ss.warehouse_id ASC, ss.client_id ASC`,
-      params
+        agg.warehouse_id,
+        agg.client_id,
+        agg.days_count,
+        agg.avg_cbm,
+        agg.avg_pallet,
+        ${rateCbmExpr} AS rate_cbm,
+        ? AS rate_pallet,
+        ROUND(agg.avg_cbm * ${rateCbmExpr}, 4) AS amount_cbm,
+        ROUND(agg.avg_pallet * ?, 4) AS amount_pallet,
+        ROUND((agg.avg_cbm * ${rateCbmExpr}) + (agg.avg_pallet * ?), 4) AS amount_total
+       FROM (
+         SELECT
+          ss.warehouse_id,
+          ss.client_id,
+          COUNT(DISTINCT ss.snapshot_date) AS days_count,
+          ROUND(SUM(ss.total_cbm) / NULLIF(COUNT(DISTINCT ss.snapshot_date), 0), 4) AS avg_cbm,
+          ROUND(SUM(ss.total_pallet) / NULLIF(COUNT(DISTINCT ss.snapshot_date), 0), 4) AS avg_pallet
+         FROM storage_snapshots ss
+         ${where}
+         GROUP BY ss.warehouse_id, ss.client_id
+       ) agg
+       LEFT JOIN warehouses w ON w.id = agg.warehouse_id
+       ORDER BY agg.warehouse_id ASC, agg.client_id ASC`,
+      finalParams
     );
 
     const summary = lines.reduce(
@@ -475,7 +516,7 @@ async function getStorageBillingPreview(req, res) {
       ok: true,
       month,
       rates: {
-        rateCbm: rateCbmResult.value,
+        rateCbm: hasRateCbmOverride ? rateCbmResult.value : null,
         ratePallet: ratePalletResult.value
       },
       filters: {
@@ -486,6 +527,103 @@ async function getStorageBillingPreview(req, res) {
         amount_total: Number(summary.amount_total.toFixed(4)),
         amount_cbm: Number(summary.amount_cbm.toFixed(4)),
         amount_pallet: Number(summary.amount_pallet.toFixed(4))
+      },
+      lines
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: error.message });
+  }
+}
+
+async function getStorageBillingSkuPreview(req, res) {
+  const monthResult = resolveMonthRequired(req.query.month);
+  if (!monthResult.ok) {
+    return res.status(400).json({ ok: false, message: monthResult.message });
+  }
+
+  const warehouseIdResult = parseOptionalPositiveInt(req.query.warehouseId, "warehouseId");
+  if (!warehouseIdResult.ok || !warehouseIdResult.value) {
+    return res.status(400).json({ ok: false, message: "warehouseId is required." });
+  }
+
+  const clientIdResult = parseOptionalPositiveInt(req.query.clientId, "clientId");
+  if (!clientIdResult.ok || !clientIdResult.value) {
+    return res.status(400).json({ ok: false, message: "clientId is required." });
+  }
+
+  const rateCbmResult = parseOptionalNonNegativeNumber(req.query.rateCbm, "rateCbm", null);
+  if (!rateCbmResult.ok) {
+    return res.status(400).json({ ok: false, message: rateCbmResult.message });
+  }
+
+  try {
+    const pool = getPool();
+    const hasDefaultCbmRate = await hasColumn("warehouses", "default_cbm_rate");
+    let effectiveRateCbm = Number(rateCbmResult.value ?? 0);
+
+    if (rateCbmResult.value == null && hasDefaultCbmRate) {
+      const [warehouseRows] = await pool.query(
+        `SELECT default_cbm_rate
+         FROM warehouses
+         WHERE id = ? AND deleted_at IS NULL
+         LIMIT 1`,
+        [warehouseIdResult.value]
+      );
+      effectiveRateCbm = Number(warehouseRows[0]?.default_cbm_rate || 0);
+    }
+
+    const [rows] = await pool.query(
+      `SELECT
+        p.id AS product_id,
+        p.sku_code,
+        p.name_kr AS product_name,
+        SUM(sb.available_qty) AS available_qty,
+        ROUND(COALESCE(NULLIF(p.cbm_m3, 0), NULLIF(p.volume_ml, 0) / 1000000, 0), 6) AS cbm_m3,
+        ROUND(
+          SUM(sb.available_qty) * COALESCE(NULLIF(p.cbm_m3, 0), NULLIF(p.volume_ml, 0) / 1000000, 0) * ?,
+          4
+        ) AS amount_cbm
+       FROM stock_balances sb
+       JOIN products p ON p.id = sb.product_id
+       WHERE sb.deleted_at IS NULL
+         AND p.deleted_at IS NULL
+         AND sb.available_qty > 0
+         AND sb.warehouse_id = ?
+         AND sb.client_id = ?
+       GROUP BY p.id, p.sku_code, p.name_kr, p.cbm_m3, p.volume_ml
+       ORDER BY amount_cbm DESC, p.id ASC`,
+      [effectiveRateCbm, warehouseIdResult.value, clientIdResult.value]
+    );
+
+    const lines = rows.map((row) => {
+      const cbmM3 = Number(row.cbm_m3 || 0);
+      return {
+        ...row,
+        rate_cbm: effectiveRateCbm,
+        warning: cbmM3 <= 0 ? "missing_cbm" : null
+      };
+    });
+
+    const summary = lines.reduce(
+      (acc, row) => {
+        acc.total_available_qty += Number(row.available_qty || 0);
+        acc.total_amount_cbm += Number(row.amount_cbm || 0);
+        acc.missing_cbm_count += row.warning ? 1 : 0;
+        return acc;
+      },
+      { total_available_qty: 0, total_amount_cbm: 0, missing_cbm_count: 0 }
+    );
+
+    return res.json({
+      ok: true,
+      month: monthResult.value,
+      warehouse_id: warehouseIdResult.value,
+      client_id: clientIdResult.value,
+      rate_cbm: effectiveRateCbm,
+      summary: {
+        total_available_qty: Number(summary.total_available_qty.toFixed(4)),
+        total_amount_cbm: Number(summary.total_amount_cbm.toFixed(4)),
+        missing_cbm_count: summary.missing_cbm_count
       },
       lines
     });
@@ -573,6 +711,7 @@ router.post("/storage/snapshots/generate", generateSnapshots);
 router.get("/storage", getStorageDashboard);
 router.get("/storage/trend", getStorageTrend);
 router.get("/storage/billing/preview", getStorageBillingPreview);
+router.get("/storage/billing/sku-preview", getStorageBillingSkuPreview);
 router.get("/storage/capacity", getStorageCapacity);
 
 module.exports = {
