@@ -477,7 +477,10 @@ async function getStorageBillingPreview(req, res) {
     const [lines] = await pool.query(
       `SELECT
         agg.warehouse_id,
+        w.name AS warehouse_name,
         agg.client_id,
+        c.name_kr AS client_name,
+        COALESCE(sku.sku_count, 0) AS sku_count,
         agg.days_count,
         agg.avg_cbm,
         agg.avg_pallet,
@@ -498,6 +501,17 @@ async function getStorageBillingPreview(req, res) {
          GROUP BY ss.warehouse_id, ss.client_id
        ) agg
        LEFT JOIN warehouses w ON w.id = agg.warehouse_id
+       LEFT JOIN clients c ON c.id = agg.client_id
+       LEFT JOIN (
+         SELECT
+          sb.warehouse_id,
+          sb.client_id,
+          COUNT(DISTINCT sb.product_id) AS sku_count
+         FROM stock_balances sb
+         WHERE sb.deleted_at IS NULL
+           AND sb.available_qty > 0
+         GROUP BY sb.warehouse_id, sb.client_id
+       ) sku ON sku.warehouse_id = agg.warehouse_id AND sku.client_id = agg.client_id
        ORDER BY agg.warehouse_id ASC, agg.client_id ASC`,
       finalParams
     );
@@ -594,6 +608,14 @@ async function getStorageBillingSkuPreview(req, res) {
        ORDER BY amount_cbm DESC, p.id ASC`,
       [effectiveRateCbm, warehouseIdResult.value, clientIdResult.value]
     );
+    const [scopeRows] = await pool.query(
+      `SELECT w.name AS warehouse_name, c.name_kr AS client_name
+       FROM warehouses w
+       JOIN clients c ON c.id = ?
+       WHERE w.id = ?
+       LIMIT 1`,
+      [clientIdResult.value, warehouseIdResult.value]
+    );
 
     const lines = rows.map((row) => {
       const cbmM3 = Number(row.cbm_m3 || 0);
@@ -619,11 +641,14 @@ async function getStorageBillingSkuPreview(req, res) {
       month: monthResult.value,
       warehouse_id: warehouseIdResult.value,
       client_id: clientIdResult.value,
+      warehouse_name: scopeRows[0]?.warehouse_name ?? null,
+      client_name: scopeRows[0]?.client_name ?? null,
       rate_cbm: effectiveRateCbm,
       summary: {
         total_available_qty: Number(summary.total_available_qty.toFixed(4)),
         total_amount_cbm: Number(summary.total_amount_cbm.toFixed(4)),
-        missing_cbm_count: summary.missing_cbm_count
+        missing_cbm_count: summary.missing_cbm_count,
+        total_sku_count: lines.length
       },
       lines
     });
